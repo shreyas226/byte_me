@@ -1,0 +1,35 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies for rasterio/GDAL
+RUN apt-get update && apt-get install -y \
+    gdal-bin \
+    libgdal-dev \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CPLUS_INCLUDE_PATH=/usr/include/gdal
+ENV C_INCLUDE_PATH=/usr/include/gdal
+
+COPY requirements.txt .
+
+# Install Python dependencies using CPU-only PyTorch index
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple -r requirements.txt
+
+
+# Pre-download the Hugging Face model during the image build to speed up startup
+# (Optional, but good for local dev)
+ENV HF_HOME=/app/.cache/huggingface
+RUN python -c "from transformers import AutoModel; AutoModel.from_pretrained('ibm-nasa-geospatial/Prithvi-EO-1.0-100M', trust_remote_code=True)" || true
+
+# Copy application code and scripts
+COPY . .
+
+# Ensure output and asset directories exist
+RUN mkdir -p data/deforestation data/disaster public/masks public/images raw_data
+
+EXPOSE 8082
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8082"]

@@ -1,0 +1,97 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Lockfiles (regenerated from package.json)
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Scratch & temporary artifacts
+scratch/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local config
+*.local
+.config/
+
+# Build tools
+.builder/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# SatQuery AI service — runtime outputs & datasets
+satquery-service/data/
+satquery-service/public/masks/
+satquery-service/public/images/
+satquery-service/raw_data/
+ai-inference-service/data/
+ai-inference-service/public/masks/
+ai-inference-service/public/images/
+ai-inference-service/raw_data/
+satquery-service/eval/benchmark_data/raw_*
+satquery-service/eval/benchmark_data/real_images/
+satquery-service/eval/benchmark_data/*_test_real.json
+satquery-service/eval/benchmark_data/sanitycheck_*.json
+benchmark_results.json
+benchmark_results.csv
+
+# GeoChat ML Environment & Model Cache
+ml/geochat/venv/
+ml/geochat/GeoChat/
+ml/geochat/eval_samples/
+ml/geochat/finetune/checkpoints/
+ml/geochat/finetune/dataset/
+
+# Temporary generated images
+public/nasa_check_tmp.jpg
+# Debug output files from development sessions
+debug_out*.txt
+debug_out*.json
+
+# Root-level dev/QA result dumps (e2e runs, geochat smoke-tests, etc.)
+e2e_*.json
+real_geochat_*.json
+*_result.json
+
+# Temporary data fetch scripts
+satquery-service/scripts/fetch_real_sat_data.py

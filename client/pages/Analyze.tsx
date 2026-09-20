@@ -1,0 +1,1532 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useSearchParams, Link } from "react-router-dom";
+import { Play, Sparkles, Terminal, Loader2, ScanSearch, AlertCircle, Upload, X, FileImage, Download, Target, ArrowRightLeft, FlaskConical, Leaf, Map, BarChart2, Layers, MapPin, Calendar, Satellite, Globe2, ChevronDown, ChevronUp, SlidersHorizontal, Info, FileText } from "lucide-react";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import { normalizeGroundingBox } from "@/lib/grounding-boxes";
+import { recordAudit } from "@/lib/audit-store";
+
+const AI_SERVICE_URL = import.meta.env.VITE_AI_SERVICE_URL || "http://localhost:8082";
+
+type Modality = "optical" | "sar" | "both";
+type Temporal = "single" | "bi-temporal";
+type TaskHint = "auto" | "vqa" | "grounding" | "change" | "sar_fusion";
+type ScenarioId = "deforestation" | "disaster";
+type InputMode = "upload" | "location";
+type SatCollection = "sentinel-2-l2a" | "sentinel-1-grd" | "landsat-c2-l2";
+
+interface Scenario {
+  id: ScenarioId;
+  title: string;
+  description: string;
+  beforeImage: string;
+  afterImage: string;
+}
+
+const SCENARIOS: Record<ScenarioId, Scenario> = {
+  deforestation: {
+    id: "deforestation",
+    title: "Deforestation",
+    description: "Rondônia, Brazil — Sentinel-2 L2A, 2019 vs 2023",
+    beforeImage: `${AI_SERVICE_URL}/images/deforestation-before.jpg`,
+    afterImage: `${AI_SERVICE_URL}/images/deforestation-after.jpg`,
+  },
+  disaster: {
+    id: "disaster",
+    title: "Disaster Response",
+    description: "Post-cyclone coastal district — Sentinel-2 Bi-Temporal Pair",
+    beforeImage: `${AI_SERVICE_URL}/images/disaster-before.jpg`,
+    afterImage: `${AI_SERVICE_URL}/images/disaster-after.jpg`,
+  },
+};
+
+const SCENARIO_PROMPTS: Record<string, string> = {
+  deforestation: "Analyze forest cover loss, canopy reduction, and spectral vegetation changes between these scenes.",
+  grounding: "Please detect, locate, and ground all primary infrastructure, buildings, and structures in this view.",
+  sar_inundation: "Identify surface water expansion, flood boundaries, and inundated terrain using SAR backscatter analysis.",
+  optical_sar_fusion: "Fuse optical spectral channels with SAR radar signals to map land surface features despite atmospheric noise.",
+};
+
+// Keep demo imagery unobstructed; grounding coordinates remain available in API JSON.
+const SHOW_GROUNDING_OVERLAYS = false;
+
+const PRESET_QUERIES = [
+  {
+    label: "Deforestation Analysis",
+    query: SCENARIO_PROMPTS.deforestation,
+    modality: "optical" as Modality,
+    temporal: "bi-temporal" as Temporal,
+    taskHint: "change" as TaskHint,
+    scenario: "deforestation" as ScenarioId,
+    scenarioPreset: "deforestation",
+    description: "Track canopy loss and timber roads across time — provides verifiable evidence for conservation enforcement.",
+  },
+  {
+    label: "Building & Object Grounding",
+    query: SCENARIO_PROMPTS.grounding,
+    modality: "optical" as Modality,
+    temporal: "single" as Temporal,
+    taskHint: "grounding" as TaskHint,
+    scenarioPreset: "grounding",
+    description: "Locate and demarcate infrastructure footprints — turns unstructured overhead imagery into structured asset inventories.",
+  },
+  {
+    label: "SAR Inundation Detection",
+    query: SCENARIO_PROMPTS.sar_inundation,
+    modality: "sar" as Modality,
+    temporal: "single" as Temporal,
+    taskHint: "sar_fusion" as TaskHint,
+    scenarioPreset: "sar_inundation",
+    description: "See flood extent through cloud cover — critical when optical satellites can't get a clear image during a storm.",
+  },
+  {
+    label: "Optical–SAR Multimodal Fusion",
+    query: SCENARIO_PROMPTS.optical_sar_fusion,
+    modality: "both" as Modality,
+    temporal: "single" as Temporal,
+    taskHint: "sar_fusion" as TaskHint,
+    scenarioPreset: "optical_sar_fusion",
+    description: "Fuse radar roughness with multispectral bands — maps soil moisture and surface features even under heavy haze.",
+  },
+];
+
+interface GroundingBox {
+  label: string;
+  box_normalized: [number, number, number, number]; // [xmin, ymin, xmax, ymax]
+  box_pixels?: [number, number, number, number];
+  score_token?: string;
+}
+
+interface ExecutionTrace {
+  task: string;
+  specialist_used: string;
+  parameters: Record<string, any>;
+}
+
+interface NdviResult {
+  vegetation_pct: number;
+  vegetation_pct_sparse?: number;
+  vegetation_pct_dense?: number;
+  mean_ndvi: number;
+  valid_pixels?: number;
+  total_pixels?: number;
+}
+
+interface LandcoverResult {
+  dense_vegetation_pct: number;
+  sparse_vegetation_pct: number;
+  bare_soil_pct: number;
+  water_or_shadow_pct: number;
+  non_vegetated_pct: number;
+}
+
+interface SpectralChangeResult {
+  changed_pct: number;
+  changed_pixels: number;
+  total_pixels: number;
+  change_area_km2: number | null;
+  georeferenced: boolean;
+}
+
+interface ObjectAreaResult {
+  label: string;
+  box_normalized: number[];
+  area_km2: number | null;
+  area_m2: number | null;
+  georeferenced: boolean;
+}
+
+interface ComputedMetrics {
+  task: string;
+  georeferenced?: boolean;
+  // VQA / single-image
+  ndvi?: NdviResult;
+  landcover?: LandcoverResult;
+  // Change-VQA
+  before_ndvi?: NdviResult;
+  after_ndvi?: NdviResult;
+  before_landcover?: LandcoverResult;
+  after_landcover?: LandcoverResult;
+  spectral_change?: SpectralChangeResult;
+  // Grounding
+  object_areas?: ObjectAreaResult[];
+}
+
+interface AnalyzeResponse {
+  answer: string;
+  confidence: number | null;
+  visual_evidence: GroundingBox[] | {
+    mask_url?: string | null;
+    change_percentage?: number | null;
+    bounding_boxes?: any[];
+  } | null;
+  computed_metrics: ComputedMetrics | null;
+  execution_trace: ExecutionTrace;
+  narrative?: string;
+  preview_image_base64?: string;
+  preview_images_base64?: string[];
+  data_warnings?: string[];
+  data_source?: "cached_catalog" | "live_fallback" | string;
+}
+
+// ─── Deterministic Metrics Panel ────────────────────────────────────────────
+
+function MetricRow({ label, value, unit, highlight }: { label: string; value: string | number | null; unit?: string; highlight?: boolean }) {
+  if (value === null || value === undefined) return null;
+  return (
+    <div className="flex items-center justify-between py-1.5 border-b border-border/30 last:border-0">
+      <span className="text-[11px] text-muted-foreground">{label}</span>
+      <span className={`font-mono text-[12px] font-semibold ${highlight ? "text-primary" : "text-foreground"}`}>
+        {typeof value === "number" ? value.toFixed(3) : value}{unit ? ` ${unit}` : ""}
+      </span>
+    </div>
+  );
+}
+
+function NdviBlock({ label, ndvi }: { label: string; ndvi: NdviResult }) {
+  const sparseVal = ndvi.vegetation_pct_sparse ?? ndvi.vegetation_pct;
+  const denseVal = ndvi.vegetation_pct_dense;
+
+  return (
+    <div className="space-y-1">
+      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1">
+        <Leaf className="h-3 w-3" />{label}
+      </p>
+      <MetricRow label="Sparse Veg. (>0.2)" value={sparseVal} unit="%" />
+      {denseVal !== undefined && (
+        <MetricRow label="Dense Canopy (>0.5)" value={denseVal} unit="%" highlight />
+      )}
+      <MetricRow label="Mean NDVI" value={ndvi.mean_ndvi} />
+      <MetricRow label="Valid Pixels" value={ndvi.total_pixels ?? ndvi.valid_pixels} />
+    </div>
+  );
+}
+
+function LandcoverBlock({ label, lc }: { label: string; lc: LandcoverResult }) {
+  return (
+    <div className="space-y-1">
+      <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1">
+        <Map className="h-3 w-3" />{label}
+      </p>
+      <MetricRow label="Dense Veg." value={lc.dense_vegetation_pct} unit="%" />
+      <MetricRow label="Sparse Veg." value={lc.sparse_vegetation_pct} unit="%" />
+      <MetricRow label="Bare Soil" value={lc.bare_soil_pct} unit="%" />
+      <MetricRow label="Water / Shadow" value={lc.water_or_shadow_pct} unit="%" />
+      <MetricRow label="Non-Vegetated" value={lc.non_vegetated_pct} unit="%" />
+    </div>
+  );
+}
+
+function ComputedMetricsPanel({ metrics }: { metrics: ComputedMetrics }) {
+  const task = metrics.task;
+
+  return (
+    <div className="rounded-xl border border-border bg-card p-5 shadow-xl">
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-border/60 pb-3 mb-4">
+        <span className="label-micro text-muted-foreground flex items-center gap-2">
+          <FlaskConical className="h-4 w-4 text-primary" /> DETERMINISTIC MEASUREMENTS
+        </span>
+        <span
+          title="Computed by geospatial_metrics.py — no LLM involved"
+          className="text-[10px] font-mono px-2 py-0.5 rounded bg-primary/10 border border-primary/20 text-primary cursor-help"
+        >
+          {metrics.georeferenced ? "GEOREF ✓" : "NO GEOREF"}
+        </span>
+      </div>
+
+      <div className="space-y-4 text-xs">
+        {/* ── VQA / single-image ── */}
+        {task === "vqa" && (
+          <>
+            {metrics.ndvi && <NdviBlock label="NDVI Coverage" ndvi={metrics.ndvi} />}
+            {metrics.landcover && <LandcoverBlock label="Land Cover" lc={metrics.landcover} />}
+          </>
+        )}
+
+        {/* ── Change VQA ── */}
+        {task === "change_vqa" && (
+          <>
+            {metrics.before_ndvi && <NdviBlock label="Before — NDVI" ndvi={metrics.before_ndvi} />}
+            {metrics.after_ndvi && <NdviBlock label="After — NDVI" ndvi={metrics.after_ndvi} />}
+            {metrics.before_landcover && <LandcoverBlock label="Before — Land Cover" lc={metrics.before_landcover} />}
+            {metrics.after_landcover && <LandcoverBlock label="After — Land Cover" lc={metrics.after_landcover} />}
+            {metrics.spectral_change && (
+              <div className="space-y-1">
+                <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1">
+                  <BarChart2 className="h-3 w-3" />Spectral Change Area
+                </p>
+                <MetricRow label="Changed Surface" value={metrics.spectral_change.changed_pct} unit="%" highlight />
+                <MetricRow label="Changed Pixels" value={metrics.spectral_change.changed_pixels} />
+                <MetricRow
+                  label="Area"
+                  value={metrics.spectral_change.change_area_km2 !== null ? metrics.spectral_change.change_area_km2 : "N/A (no georef)"}
+                  unit={metrics.spectral_change.change_area_km2 !== null ? "km²" : undefined}
+                  highlight={metrics.spectral_change.change_area_km2 !== null}
+                />
+              </div>
+            )}
+          </>
+        )}
+
+        {/* ── Grounding ── */}
+        {task === "grounding" && metrics.object_areas && metrics.object_areas.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1">
+              <Layers className="h-3 w-3" />Detected Object Areas
+            </p>
+            <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1">
+              {metrics.object_areas.map((obj, i) => (
+                <div key={i} className="flex items-center justify-between p-2 rounded bg-[#141414] border border-border/60 text-[11px]">
+                  <span className="text-foreground font-medium truncate max-w-[160px]">{obj.label}</span>
+                  <span className="font-mono text-primary ml-2 shrink-0">
+                    {obj.area_km2 !== null
+                      ? `${obj.area_km2.toFixed(4)} km²`
+                      : obj.area_m2 !== null
+                      ? `${obj.area_m2.toFixed(1)} m²`
+                      : "N/A"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Reliability note */}
+        <p className="text-[10px] text-muted-foreground/50 pt-1 border-t border-border/20">
+          These values are computed deterministically from raw pixel data — independent of the model answer above.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+
+function ImageComparisonViewer({ beforeImage, afterImage, title }: { beforeImage: string; afterImage: string; title?: string }) {
+  const [comparison, setComparison] = useState(50);
+
+  return (
+    <div className="relative min-h-[440px] rounded-xl border border-border bg-[#121212] overflow-hidden flex flex-col shadow-xl group">
+      {title && (
+        <div className="z-20 bg-background/90 backdrop-blur-md px-3.5 py-2 border-b border-border text-xs font-semibold text-foreground flex items-center gap-2">
+          <ScanSearch className="h-3.5 w-3.5 text-primary" />
+          <span>{title}</span>
+        </div>
+      )}
+      <div className="relative w-full h-[400px] bg-black overflow-hidden flex-1">
+        {/* After Image (Background) */}
+        <img
+          src={afterImage}
+          alt="After / Post-event Satellite Imagery"
+          className="absolute inset-0 w-full h-full object-cover"
+        />
+
+        {/* Before Image (Foreground, clipped) */}
+        <div
+          className="absolute inset-y-0 left-0 overflow-hidden border-r-2 border-primary shadow-[4px_0_12px_rgba(0,0,0,0.6)]"
+          style={{ width: `${comparison}%` }}
+        >
+          <img
+            src={beforeImage}
+            alt="Before / Pre-event Satellite Imagery"
+            className="absolute inset-0 w-full h-full object-cover"
+            style={{ width: `${(100 / Math.max(comparison, 0.1)) * 100}%`, maxWidth: "none" }}
+          />
+        </div>
+
+        {/* Slider Handle — translateX(-50%) keeps handle centred on the divider at all positions */}
+        <div
+          className="absolute inset-y-0 flex items-center justify-center pointer-events-none z-10"
+          style={{ left: `${comparison}%`, transform: "translateX(-50%)" }}
+        >
+          <div className="h-9 w-9 rounded-full bg-card/95 border border-primary flex items-center justify-center shadow-[0_0_15px_rgba(0,0,0,0.8)] text-primary transition-transform group-hover:scale-110">
+            <ArrowRightLeft className="h-4 w-4" />
+          </div>
+        </div>
+
+        {/* Range Input Control */}
+        <input
+          type="range"
+          min="0"
+          max="100"
+          value={comparison}
+          onChange={(e) => setComparison(Number(e.target.value))}
+          aria-label="Before and after comparison position slider"
+          className="absolute inset-0 w-full h-full opacity-0 cursor-ew-resize z-20"
+        />
+      </div>
+
+      <div className="h-10 w-full border-t border-border flex items-center justify-between px-6 bg-card/90 backdrop-blur-sm z-10">
+        <span className="label-micro font-semibold tracking-wider text-muted-foreground">BEFORE (PRE-EVENT)</span>
+        <ScanSearch aria-hidden="true" className="h-4 w-4 text-primary/60" />
+        <span className="label-micro font-semibold tracking-wider text-muted-foreground">AFTER (POST-EVENT)</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Mini Leaflet map for coordinate picking ──────────────────────────────────
+function LocationPickerMap({ lat, lon, onPick }: { lat: number | null; lon: number | null; onPick: (lat: number, lon: number) => void }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<L.Map | null>(null);
+  const markerRef = useRef<L.Marker | null>(null);
+
+  useEffect(() => {
+    if (!containerRef.current || mapRef.current) return;
+    const map = L.map(containerRef.current, {
+      center: [lat ?? 20, lon ?? 0],
+      zoom: lat !== null ? 6 : 2,
+      zoomControl: true,
+      attributionControl: false,
+    });
+    L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 19,
+      attribution: "Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community",
+    }).addTo(map);
+    mapRef.current = map;
+
+    if (lat !== null && lon !== null) {
+      markerRef.current = L.marker([lat, lon]).addTo(map);
+    }
+
+    map.on("click", (e: L.LeafletMouseEvent) => {
+      const { lat: clickLat, lng: clickLon } = e.latlng;
+      if (markerRef.current) {
+        markerRef.current.setLatLng([clickLat, clickLon]);
+      } else {
+        markerRef.current = L.marker([clickLat, clickLon]).addTo(map);
+      }
+      onPick(Math.round(clickLat * 10000) / 10000, Math.round(clickLon * 10000) / 10000);
+    });
+
+    return () => { map.remove(); mapRef.current = null; markerRef.current = null; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Sync marker when lat/lon inputs change externally
+  useEffect(() => {
+    if (!mapRef.current || lat === null || lon === null) return;
+    if (markerRef.current) {
+      markerRef.current.setLatLng([lat, lon]);
+    } else {
+      markerRef.current = L.marker([lat, lon]).addTo(mapRef.current);
+    }
+    mapRef.current.setView([lat, lon], Math.max(mapRef.current.getZoom(), 6));
+  }, [lat, lon]);
+
+  return (
+    <div className="relative w-full rounded-lg overflow-hidden border border-border" style={{ height: 260 }}>
+      <div
+        ref={containerRef}
+        className="w-full h-full"
+        style={{ cursor: "crosshair" }}
+      />
+      <div className="absolute bottom-1 right-1 z-[400] text-[9px] text-zinc-400 bg-zinc-950/80 backdrop-blur-sm border border-zinc-800 px-1.5 py-0.5 rounded pointer-events-none">
+        &copy; Esri World Imagery
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+export default function Analyze() {
+  const [searchParams] = useSearchParams();
+  const initialQuery = searchParams.get("query") || "Please detect and ground all major infrastructure, buildings, or structures in this aerial view.";
+  // True when the user arrived from an Earth Event deep-link (e.g. the home page "Query Event" button)
+  const arrivedViaEventLink = searchParams.has("query");
+
+  const [query, setQuery] = useState(initialQuery);
+  const [modality, setModality] = useState<Modality>("optical");
+  const [temporal, setTemporal] = useState<Temporal>("single");
+  const [taskHint, setTaskHint] = useState<TaskHint>("auto");
+  const [scenarioId, setScenarioId] = useState<ScenarioId | null>(null);
+  const [scenarioPreset, setScenarioPreset] = useState<string>("");
+  const [hoveredPreset, setHoveredPreset] = useState<string | null>(null);
+
+  // Input mode: upload or query-by-location
+  const [inputMode, setInputMode] = useState<InputMode>("upload");
+
+  // Collapsible Advanced Options toggle (local state, not persisted)
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Execution Trace collapsible state: default collapsed, auto-expands on data_warnings
+  const [showTrace, setShowTrace] = useState(false);
+
+  // Location query state
+  const [locationLat, setLocationLat] = useState<number | null>(null);
+  const [locationLon, setLocationLon] = useState<number | null>(null);
+  const [locationLatStr, setLocationLatStr] = useState("");
+  const [locationLonStr, setLocationLonStr] = useState("");
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+  const [satCollection, setSatCollection] = useState<SatCollection>("sentinel-2-l2a");
+
+  const handleLocationPick = useCallback((lat: number, lon: number) => {
+    setLocationLat(lat);
+    setLocationLon(lon);
+    setLocationLatStr(String(lat));
+    setLocationLonStr(String(lon));
+  }, []);
+
+  const syncLatInput = (val: string) => {
+    setLocationLatStr(val);
+    const n = parseFloat(val);
+    if (!isNaN(n) && n >= -90 && n <= 90) setLocationLat(n);
+  };
+
+  const syncLonInput = (val: string) => {
+    setLocationLonStr(val);
+    const n = parseFloat(val);
+    if (!isNaN(n) && n >= -180 && n <= 180) setLocationLon(n);
+  };
+
+  // File upload state for user-provided satellite images
+  const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
+  const [filePreviewUrls, setFilePreviewUrls] = useState<string[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const [isRunning, setIsRunning] = useState(false);
+  const [result, setResult] = useState<AnalyzeResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const q = searchParams.get("query");
+    if (q) setQuery(q);
+  }, [searchParams]);
+
+  // Clean up object URLs on unmount or file change
+  useEffect(() => {
+    const urls = uploadedFiles.map((f) => URL.createObjectURL(f));
+    setFilePreviewUrls(urls);
+    return () => urls.forEach((u) => URL.revokeObjectURL(u));
+  }, [uploadedFiles]);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      const filesArr = Array.from(e.target.files);
+      setUploadedFiles((prev) => [...prev, ...filesArr].slice(0, 4));
+      setError(null);
+    }
+  };
+
+  const handleRemoveFile = (index: number) => {
+    setUploadedFiles((prev) => prev.filter((_, i) => i !== index));
+    // Also clear stale result so the panel resets when a file is removed
+    setResult(null);
+    setError(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  /** Wipe uploaded files + previous result when the user changes modes / presets. */
+  const clearWorkspace = () => {
+    setUploadedFiles([]);
+    setResult(null);
+    setError(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleScenarioClick = (scenarioKey: string) => {
+    setScenarioPreset(scenarioKey);
+    setQuery(SCENARIO_PROMPTS[scenarioKey] || "");
+  };
+
+  const handleRunAnalysis = async () => {
+    if (!query.trim()) return;
+
+    // Location mode validation
+    if (inputMode === "location") {
+      if (locationLat === null || locationLon === null) {
+        setError("Please provide a valid latitude and longitude, or click on the map to pick a location.");
+        return;
+      }
+    }
+
+    setIsRunning(true);
+    setError(null);
+    setResult(null);
+
+    try {
+      let finalQuery = query.trim();
+      if (taskHint === "grounding" && !finalQuery.toLowerCase().includes("where") && !finalQuery.toLowerCase().includes("detect") && !finalQuery.toLowerCase().includes("locate") && !finalQuery.toLowerCase().includes("ground")) {
+        finalQuery = `Where are the ${finalQuery}? Locate and ground bounding boxes.`;
+      }
+
+      let response: Response;
+
+      if (inputMode === "location") {
+        // Query by location: backend looks up catalogued scene and lazily fetches pixels
+        response = await fetch(`${AI_SERVICE_URL}/api/analyze`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: finalQuery,
+            modality,
+            temporal,
+            lat: locationLat,
+            lon: locationLon,
+            start_date: startDate || undefined,
+            end_date: endDate || undefined,
+            collection: satCollection,
+            scenario_preset: scenarioPreset || undefined,
+          }),
+        });
+      } else if (uploadedFiles.length > 0) {
+        // Send multipart/form-data for user-uploaded satellite files
+        const formData = new FormData();
+        formData.append("query", finalQuery);
+        formData.append("modality", modality);
+        formData.append("temporal", temporal);
+        if (scenarioPreset) formData.append("scenario_preset", scenarioPreset);
+        if (temporal === "bi-temporal" && scenarioId) {
+          formData.append("scenario", scenarioId);
+        }
+        uploadedFiles.forEach((file, i) => {
+          formData.append(`file_${i}`, file);
+        });
+
+        response = await fetch(`${AI_SERVICE_URL}/api/analyze`, {
+          method: "POST",
+          body: formData,
+        });
+      } else {
+        // Standard JSON request (scenario-based)
+        response = await fetch(`${AI_SERVICE_URL}/api/analyze`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: finalQuery,
+            modality,
+            temporal,
+            scenario: temporal === "bi-temporal" && scenarioId ? scenarioId : undefined,
+            scenario_preset: scenarioPreset || undefined,
+          }),
+        });
+      }
+
+      if (!response.ok) {
+        const errJson = await response.json().catch(() => null);
+        throw new Error(errJson?.detail || `Service returned HTTP ${response.status}`);
+      }
+
+      const data: AnalyzeResponse = await response.json();
+      setResult(data);
+
+      // Hand the trace to /audit — the Analyze panel now only links to it.
+      if (data?.execution_trace) {
+        recordAudit({
+          timestamp: Date.now(),
+          query,
+          task: data.execution_trace.task,
+          specialistUsed: data.execution_trace.specialist_used,
+          parameters: data.execution_trace.parameters ?? {},
+          dataSource: data.data_source,
+          dataWarnings: data.data_warnings,
+          answer: data.answer,
+          narrative: data.narrative,
+        });
+      }
+      // Auto-expand trace if data_warnings are present so user immediately sees diagnostic details
+      if (data.data_warnings && data.data_warnings.length > 0) {
+        setShowTrace(true);
+      } else {
+        setShowTrace(false);
+      }
+    } catch (e: any) {
+      console.error("Analysis query failed", e);
+      setError(e.message || "Failed to reach SatQuery AI service. Please verify backend state.");
+    } finally {
+      setIsRunning(false);
+    }
+  };
+
+  const handleExportJson = () => {
+    if (!result) return;
+    const blob = new Blob([JSON.stringify(result, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `satquery_analysis_${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const currentScenario = scenarioId ? SCENARIOS[scenarioId] : null;
+  const isGroundingResult = Array.isArray(result?.visual_evidence);
+  const groundingBoxes: GroundingBox[] = isGroundingResult ? (result.visual_evidence as GroundingBox[]) : [];
+
+  const TASK_HINT_LABELS: Record<TaskHint, string> = {
+    auto: "Auto Classifier",
+    vqa: "Optical VQA",
+    grounding: "Grounding",
+    change: "Change VQA",
+    sar_fusion: "SAR Fusion",
+  };
+
+  // Determine non-default overrides inside the Advanced section
+  const activeOverrides: string[] = [];
+  if (taskHint !== "auto") {
+    activeOverrides.push(`Specialist: ${TASK_HINT_LABELS[taskHint]}`);
+  }
+  if (modality !== "optical") {
+    activeOverrides.push(`Modality: ${modality === "both" ? "Optical + SAR" : modality.toUpperCase()}`);
+  }
+  if (temporal !== "single") {
+    activeOverrides.push("Temporal: Bi-Temporal");
+  }
+  if (satCollection !== "sentinel-2-l2a") {
+    const collShort = satCollection === "sentinel-1-grd" ? "Sentinel-1 GRD" : "Landsat C2";
+    activeOverrides.push(`Collection: ${collShort}`);
+  }
+  if (startDate || endDate) {
+    activeOverrides.push(`Date: ${[startDate, endDate].filter(Boolean).join(" → ")}`);
+  }
+  if (scenarioId) {
+    activeOverrides.push(`Scenario: ${SCENARIOS[scenarioId]?.title || scenarioId}`);
+  }
+
+  return (
+    <div className="min-h-screen px-6 pb-24 pt-24 relative bg-background">
+      {/* Background Ambient Glow */}
+      <div className="absolute top-1/4 left-1/3 w-96 h-96 bg-primary/5 rounded-full blur-[140px] pointer-events-none" />
+
+      <div className="mx-auto max-w-[1400px]">
+        {/* Header Title */}
+        <div className="mb-8">
+          <h1 className="text-headline font-bold text-foreground tracking-tight text-3xl sm:text-4xl">
+            SatQuery AI Workspace
+          </h1>
+          <p className="mt-2 text-body text-muted-foreground max-w-2xl">
+            Submit natural-language queries against optical, SAR, or user-uploaded satellite imagery. Requests are dynamically routed to specialized models with auditable execution traces.
+          </p>
+        </div>
+
+        {/* ═══ Input Panel ═══ */}
+        <div className="rounded-xl border border-border bg-card/80 p-6 shadow-xl backdrop-blur-md mb-8 space-y-4">
+
+          {/* 1 ▸ Query textarea */}
+          <div>
+            <label htmlFor="query-input" className="label-micro mb-2 block text-muted-foreground">
+              Query Prompt
+            </label>
+            <textarea
+              id="query-input"
+              rows={3}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Ask SatQuery AI a question about your satellite imagery…"
+              className="w-full rounded-lg border border-border bg-[#121212] px-4 py-3 text-body text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+            />
+
+            {/* Event-link nudge */}
+            {arrivedViaEventLink && uploadedFiles.length === 0 && (
+              <div className="mt-2 flex items-start gap-2.5 rounded-md border border-primary/20 bg-primary/5 px-3.5 py-2.5 text-xs text-primary/80">
+                <Upload className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+                <span>
+                  <span className="font-semibold">Image required to analyze this event.</span>{" "}
+                  Upload a satellite image of the region using the button below, then run the query.
+                </span>
+              </div>
+            )}
+
+            {/* 2 ▸ Scenario preset pills — lightweight inline suggestions with real-world framing */}
+            <div className="mt-3 space-y-2">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[10px] uppercase tracking-widest text-muted-foreground/50 mr-1">Suggestions:</span>
+                {PRESET_QUERIES.map((preset) => {
+                  const isSelected = scenarioPreset === preset.scenarioPreset;
+                  const isHovered = hoveredPreset === preset.scenarioPreset;
+                  return (
+                    <div
+                      key={preset.label}
+                      className="relative group"
+                      onMouseEnter={() => setHoveredPreset(preset.scenarioPreset)}
+                      onMouseLeave={() => setHoveredPreset(null)}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          clearWorkspace();
+                          setQuery(preset.query);
+                          setModality(preset.modality);
+                          setTemporal(preset.temporal);
+                          setTaskHint(preset.taskHint);
+                          setScenarioId(preset.scenario ?? null);
+                          handleScenarioClick(preset.scenarioPreset);
+                        }}
+                        className={cn(
+                          "text-[11px] px-2.5 py-1 rounded-full border transition-all duration-150 select-none flex items-center gap-1.5",
+                          isSelected
+                            ? "border-primary/60 bg-primary/15 text-foreground shadow-sm shadow-primary/10"
+                            : "border-border/60 bg-transparent hover:bg-primary/10 hover:border-primary/40 text-muted-foreground hover:text-foreground"
+                        )}
+                      >
+                        <span>{preset.label}</span>
+                      </button>
+
+                      {/* Tooltip on hover */}
+                      <div className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50 hidden group-hover:flex flex-col items-center w-64 sm:w-72">
+                        <div className="rounded-lg border border-primary/30 bg-[#161616] p-2.5 text-left shadow-2xl backdrop-blur-md">
+                          <div className="flex items-center gap-1.5 mb-1 text-primary">
+                            <Info className="h-3.5 w-3.5 shrink-0" />
+                            <span className="text-[10px] font-semibold uppercase tracking-wider">Real-World Application</span>
+                          </div>
+                          <p className="text-[11px] text-foreground/90 leading-snug font-normal">
+                            {preset.description}
+                          </p>
+                        </div>
+                        {/* Triangle arrow */}
+                        <div className="w-2 h-2 -mt-1 rotate-45 border-r border-b border-primary/30 bg-[#161616]" />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Subtitle banner showing context for currently selected or hovered preset */}
+              {(() => {
+                const active = PRESET_QUERIES.find((p) => p.scenarioPreset === (hoveredPreset || scenarioPreset));
+                if (!active) return null;
+                return (
+                  <div className="flex items-start gap-2 px-3 py-1.5 rounded-md bg-primary/[0.07] border border-primary/20 text-xs text-primary/90 animate-in fade-in-50 duration-150">
+                    <Info className="h-3.5 w-3.5 shrink-0 mt-0.5 text-primary" />
+                    <div className="leading-snug">
+                      <span className="font-semibold text-foreground mr-1">{active.label}:</span>
+                      <span className="text-muted-foreground font-normal">{active.description}</span>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+
+          {/* 3 ▸ Unified input control: Upload ↔ Click Map */}
+          <div className="rounded-lg border border-border/60 bg-[#0e0e0e] overflow-hidden">
+            {/* Tab strip */}
+            <div className="flex border-b border-border/50">
+              <button
+                type="button"
+                id="input-tab-upload"
+                onClick={() => { setInputMode("upload"); setResult(null); setError(null); }}
+                className={cn(
+                  "flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium transition-all border-b-2 -mb-px",
+                  inputMode === "upload"
+                    ? "border-primary text-foreground"
+                    : "border-transparent text-muted-foreground hover:text-foreground"
+                )}
+              >
+                <Upload className="h-3.5 w-3.5" /> Upload Image
+              </button>
+              <button
+                type="button"
+                id="input-tab-location"
+                onClick={() => { setInputMode("location"); setResult(null); setError(null); }}
+                className={cn(
+                  "flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium transition-all border-b-2 -mb-px",
+                  inputMode === "location"
+                    ? "border-primary text-foreground"
+                    : "border-transparent text-muted-foreground hover:text-foreground"
+                )}
+              >
+                <Globe2 className="h-3.5 w-3.5" /> Click Map
+              </button>
+            </div>
+
+            {/* Upload panel */}
+            {inputMode === "upload" && (
+              <div className="p-4 space-y-3">
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  onChange={handleFileChange}
+                  multiple
+                  accept=".tif,.tiff,.png,.jpg,.jpeg"
+                  className="hidden"
+                />
+                {uploadedFiles.length === 0 ? (
+                  <div
+                    className="rounded-lg border-2 border-dashed border-border hover:border-primary/50 bg-[#0d0d0d] p-6 flex flex-col items-center gap-3 cursor-pointer group transition-colors duration-200"
+                    onClick={() => fileInputRef.current?.click()}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const files = Array.from(e.dataTransfer.files).filter((f) =>
+                        /\.(tif|tiff|png|jpg|jpeg)$/i.test(f.name)
+                      );
+                      if (files.length > 0) {
+                        setUploadedFiles((prev) => [...prev, ...files].slice(0, 4));
+                        setError(null);
+                      }
+                    }}
+                  >
+                    <div className="h-10 w-10 rounded-full border border-border bg-card/60 flex items-center justify-center text-muted-foreground group-hover:border-primary/40 group-hover:text-primary/70 transition-colors">
+                      <Upload className="h-5 w-5" />
+                    </div>
+                    <div className="text-center">
+                      <p className="text-sm font-semibold text-foreground">Drop a GeoTIFF or image here</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">or click to browse — .tif, .tiff, .jpg, .png</p>
+                    </div>
+                    {temporal === "bi-temporal" && currentScenario && (
+                      <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-accent/10 border border-accent/30 text-accent text-xs font-medium">
+                        <ScanSearch className="h-3.5 w-3.5 shrink-0" />
+                        Scenario configured: {currentScenario.title}
+                      </div>
+                    )}
+                    {temporal === "bi-temporal" && !currentScenario && (
+                      <p className="text-[11px] font-mono text-muted-foreground/50">
+                        No scenario selected — use the Advanced settings below to configure
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="label-micro text-muted-foreground">Staged ({uploadedFiles.length}):</span>
+                    {uploadedFiles.map((file, idx) => (
+                      <div key={idx} className="flex items-center gap-2 px-2.5 py-1 rounded-md bg-[#181818] border border-primary/30 text-xs text-foreground">
+                        <FileImage className="h-3.5 w-3.5 text-primary" />
+                        <span className="truncate max-w-[140px] font-mono">{file.name}</span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveFile(idx)}
+                          className="text-muted-foreground hover:text-destructive transition-colors ml-1"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="text-[11px] px-2.5 py-1 rounded-md border border-dashed border-border text-muted-foreground hover:border-primary/40 hover:text-foreground transition-all"
+                    >
+                      + Add
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Location panel */}
+            {inputMode === "location" && (
+              <div className="p-4 space-y-3">
+                <p className="text-xs text-muted-foreground flex items-center gap-2">
+                  <Globe2 className="h-3.5 w-3.5 text-primary" />
+                  Click the map to pick a point, or enter coordinates manually.
+                </p>
+                <LocationPickerMap lat={locationLat} lon={locationLon} onPick={handleLocationPick} />
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="label-micro block mb-1 text-muted-foreground">Latitude</label>
+                    <input
+                      type="number" step="any" min="-90" max="90"
+                      placeholder="e.g. -10.5432"
+                      value={locationLatStr}
+                      onChange={(e) => syncLatInput(e.target.value)}
+                      className="w-full rounded-lg border border-border bg-[#121212] px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="label-micro block mb-1 text-muted-foreground">Longitude</label>
+                    <input
+                      type="number" step="any" min="-180" max="180"
+                      placeholder="e.g. -62.3141"
+                      value={locationLonStr}
+                      onChange={(e) => syncLonInput(e.target.value)}
+                      className="w-full rounded-lg border border-border bg-[#121212] px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary font-mono"
+                    />
+                  </div>
+                </div>
+                {locationLat !== null && locationLon !== null && (
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-primary/10 border border-primary/25 text-primary text-xs font-mono w-fit">
+                    <MapPin className="h-3.5 w-3.5" />
+                    {locationLat.toFixed(4)}°, {locationLon!.toFixed(4)}°
+                    <span className="text-muted-foreground ml-2">· {satCollection}</span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* 4 ▸ Collapsible Advanced Options */}
+          <div className="rounded-lg border border-border/60 bg-[#0d0d0d] overflow-hidden">
+            <button
+              type="button"
+              id="advanced-options-toggle"
+              onClick={() => setShowAdvanced((prev) => !prev)}
+              className="w-full flex items-center justify-between px-4 py-2.5 text-xs text-muted-foreground hover:text-foreground hover:bg-white/[0.02] transition-colors select-none"
+            >
+              <div className="flex items-center gap-2 font-medium">
+                <SlidersHorizontal className="h-3.5 w-3.5 text-primary/70" />
+                <span>Advanced Options</span>
+                {activeOverrides.length > 0 && !showAdvanced && (
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-primary/10 border border-primary/30 text-primary">
+                    {activeOverrides.length} override{activeOverrides.length > 1 ? "s" : ""} active
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-1.5 text-muted-foreground/70 text-[11px]">
+                <span>{showAdvanced ? "Hide" : "Configure"}</span>
+                {showAdvanced ? (
+                  <ChevronUp className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                )}
+              </div>
+            </button>
+
+            {showAdvanced && (
+              <div className="p-4 border-t border-border/40 space-y-4 bg-[#101010]/50 animate-in fade-in-50 duration-150">
+                {/* Row 1: Task Specialist & Modality & Temporal */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  {/* Task Specialist Override */}
+                  <div>
+                    <label className="label-micro block mb-1 text-muted-foreground">Task Specialist Override</label>
+                    <div className="flex flex-wrap gap-1 bg-[#121212] p-1 rounded-md border border-border text-xs">
+                      {(
+                        [
+                          { id: "auto", label: "Auto Classifier" },
+                          { id: "vqa", label: "Optical VQA" },
+                          { id: "grounding", label: "Grounding" },
+                          { id: "change", label: "Change VQA" },
+                          { id: "sar_fusion", label: "SAR Fusion" },
+                        ] as { id: TaskHint; label: string }[]
+                      ).map((t) => (
+                        <button
+                          key={t.id}
+                          type="button"
+                          onClick={() => setTaskHint(t.id)}
+                          className={cn(
+                            "px-2.5 py-1 rounded font-medium transition-all whitespace-nowrap text-xs",
+                            taskHint === t.id ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                          )}
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Modality */}
+                  <div>
+                    <label className="label-micro block mb-1 text-muted-foreground">Modality</label>
+                    <div className="flex flex-wrap gap-1 bg-[#121212] p-1 rounded-md border border-border text-xs">
+                      {(["optical", "sar", "both"] as Modality[]).map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          onClick={() => { setModality(m); clearWorkspace(); }}
+                          className={cn(
+                            "px-3 py-1 rounded font-medium capitalize transition-all whitespace-nowrap text-xs",
+                            modality === m ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                          )}
+                        >
+                          {m === "both" ? "Optical + SAR" : m}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Temporal Mode */}
+                  <div>
+                    <label className="label-micro block mb-1 text-muted-foreground">Temporal Mode</label>
+                    <div className="flex flex-wrap gap-1 bg-[#121212] p-1 rounded-md border border-border text-xs">
+                      {(["single", "bi-temporal"] as Temporal[]).map((t) => (
+                        <button
+                          key={t}
+                          type="button"
+                          onClick={() => {
+                            setTemporal(t);
+                            clearWorkspace();
+                            if (t === "single") setScenarioId(null);
+                          }}
+                          className={cn(
+                            "px-3 py-1 rounded font-medium capitalize transition-all whitespace-nowrap text-xs",
+                            temporal === t ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                          )}
+                        >
+                          {t === "bi-temporal" ? "Bi-Temporal Pair" : "Single Image"}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Row 2: Satellite Collection & Date Range Filter */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t border-border/30">
+                  {/* Collection selector */}
+                  <div>
+                    <label className="label-micro block mb-1 text-muted-foreground flex items-center gap-1">
+                      <Satellite className="h-3 w-3" /> Satellite Collection
+                    </label>
+                    <select
+                      value={satCollection}
+                      onChange={(e) => setSatCollection(e.target.value as SatCollection)}
+                      className="w-full rounded-lg border border-border bg-[#121212] px-3 py-1.5 text-xs text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                    >
+                      <option value="sentinel-2-l2a">Sentinel-2 L2A</option>
+                      <option value="sentinel-1-grd">Sentinel-1 GRD (SAR)</option>
+                      <option value="landsat-c2-l2">Landsat C2 L2</option>
+                    </select>
+                  </div>
+
+                  {/* Start Date */}
+                  <div>
+                    <label className="label-micro block mb-1 text-muted-foreground flex items-center gap-1">
+                      <Calendar className="h-3 w-3" /> Start Date
+                    </label>
+                    <input
+                      type="date"
+                      value={startDate}
+                      onChange={(e) => setStartDate(e.target.value)}
+                      className="w-full rounded-lg border border-border bg-[#121212] px-3 py-1.5 text-xs text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
+
+                  {/* End Date */}
+                  <div>
+                    <label className="label-micro block mb-1 text-muted-foreground flex items-center gap-1">
+                      <Calendar className="h-3 w-3" /> End Date
+                    </label>
+                    <input
+                      type="date"
+                      value={endDate}
+                      onChange={(e) => setEndDate(e.target.value)}
+                      className="w-full rounded-lg border border-border bg-[#121212] px-3 py-1.5 text-xs text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                    />
+                  </div>
+                </div>
+
+                {/* Scenario Preset Selector (when bi-temporal is active) */}
+                {temporal === "bi-temporal" && (
+                  <div className="pt-2 border-t border-border/30">
+                    <span className="label-micro block mb-1 text-muted-foreground">Scenario Preset Pair</span>
+                    <div className="flex flex-wrap gap-1.5 bg-[#121212] p-1 rounded-md border border-border text-xs w-fit">
+                      {(Object.keys(SCENARIOS) as ScenarioId[]).map((id) => (
+                        <button
+                          key={id}
+                          type="button"
+                          onClick={() => {
+                            setScenarioId(id as ScenarioId);
+                            setTaskHint("change");
+                            if (id === "deforestation") {
+                              setQuery("What deforestation or forest cover loss is visible in these before and after images?");
+                            } else if (id === "disaster") {
+                              setQuery("What flood damage or structural changes are visible between the pre-event and post-event images?");
+                            }
+                          }}
+                          className={cn(
+                            "px-3 py-1 rounded font-medium capitalize transition-all",
+                            scenarioId === id ? "bg-accent text-accent-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                          )}
+                        >
+                          {SCENARIOS[id as ScenarioId].title}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* 5 ▸ Single Analyze CTA with Active Overrides Indicator */}
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              {activeOverrides.length > 0 ? (
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {activeOverrides.map((override, i) => (
+                    <span
+                      key={i}
+                      className="inline-flex items-center text-[11px] font-mono px-2.5 py-0.5 rounded-md bg-sky-500/10 border border-sky-500/20 text-sky-400"
+                    >
+                      {override.startsWith("Specialist: ") ? `Manual: ${override.replace("Specialist: ", "")}` : override}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-[11px] text-muted-foreground/50 font-mono">
+                  Specialist: Auto Classifier
+                </span>
+              )}
+            </div>
+
+            <Button
+              id="analyze-btn"
+              size="lg"
+              disabled={isRunning || !query.trim()}
+              onClick={handleRunAnalysis}
+              className={cn(
+                "shadow-lg min-w-[140px] transition-opacity",
+                isRunning ? "opacity-60 cursor-not-allowed" : "hover:shadow-primary/20"
+              )}
+            >
+              {isRunning ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Play className="mr-2 h-4 w-4" />
+              )}
+              {isRunning ? "Running\u2026" : "Analyze"}
+            </Button>
+          </div>
+        </div>
+
+        {/* Error Alert */}
+        {error && (
+          <div className="mb-8 rounded-lg bg-destructive/10 p-4 border border-destructive/20 text-destructive flex items-start gap-3">
+            <AlertCircle className="h-5 w-5 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold text-sm">Backend API Response Error</p>
+              <p className="text-xs mt-1 text-destructive/90">{error}</p>
+            </div>
+          </div>
+        )}
+
+        {/* Analysis Results Display */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+          {/* Left Column: Visual Evidence / Canvas Viewer with Bounding Box Overlay */}
+          <div className="lg:col-span-7 space-y-6">
+            {temporal === "bi-temporal" && result?.preview_images_base64 && result.preview_images_base64.length >= 2 ? (
+              <ImageComparisonViewer
+                beforeImage={result.preview_images_base64[0]}
+                afterImage={result.preview_images_base64[1]}
+                title={uploadedFiles.length === 0 ? currentScenario?.description : undefined}
+              />
+            ) : temporal === "bi-temporal" && uploadedFiles.length >= 2 && !result ? (
+              /* Bi-temporal TIF staged — browser can't render TIFF blobs, wait for backend preview */
+              <div className="relative min-h-[440px] rounded-xl border border-border bg-[#0d0d0d] overflow-hidden flex flex-col justify-center items-center gap-5 shadow-xl">
+                <div className="flex flex-col items-center gap-3 text-center px-8">
+                  <div className="h-12 w-12 rounded-full bg-primary/10 flex items-center justify-center">
+                    <ScanSearch className="h-6 w-6 text-primary" />
+                  </div>
+                  <p className="text-sm font-semibold text-foreground">{uploadedFiles.length} GeoTIFF files staged</p>
+                  <p className="text-xs text-muted-foreground max-w-xs">
+                    TIFF images cannot be previewed in the browser. Run the analysis to generate a visual comparison.
+                  </p>
+                  <div className="flex gap-2 flex-wrap justify-center mt-1">
+                    {uploadedFiles.map((f, i) => (
+                      <span key={i} className="text-[10px] px-2 py-1 rounded bg-card border border-border text-muted-foreground font-mono">{f.name}</span>
+                    ))}
+                  </div>
+                </div>
+                <div className="absolute bottom-0 w-full h-10 border-t border-border flex items-center justify-between px-6 bg-card/90">
+                  <span className="label-micro font-semibold tracking-wider text-muted-foreground">BEFORE (PRE-EVENT)</span>
+                  <span className="label-micro font-semibold tracking-wider text-muted-foreground">AFTER (POST-EVENT)</span>
+                </div>
+              </div>
+            ) : uploadedFiles.length > 0 ? (
+              <div className="relative min-h-[440px] rounded-xl border border-border bg-[#121212] overflow-hidden flex flex-col justify-center items-center p-4 shadow-xl">
+                <div className="relative w-full h-[400px] flex items-center justify-center bg-black/60 rounded-lg overflow-hidden">
+                  {/* Only render preview from backend base64 — raw TIF blob URLs cannot be rendered by browsers */}
+                  {result?.preview_image_base64 ? (
+                    <img
+                      src={result.preview_image_base64}
+                      alt="User Uploaded Satellite Source"
+                      className="max-h-full max-w-full object-contain"
+                    />
+                  ) : (
+                    <div className="flex flex-col items-center gap-3 text-center px-6">
+                      <ScanSearch className="h-8 w-8 text-primary/40" />
+                      <p className="text-xs text-muted-foreground">
+                        <span className="font-semibold text-foreground">{uploadedFiles[0].name}</span> staged —
+                        TIFF preview will appear after running the analysis.
+                      </p>
+                    </div>
+                  )}
+                  {/* Render Bounding Boxes for Uploaded Image */}
+                  {SHOW_GROUNDING_OVERLAYS && result?.preview_image_base64 && groundingBoxes.map((box, idx) => {
+                    const normalized = normalizeGroundingBox(box.box_normalized, "percent");
+                    if (!normalized) return null;
+                    const [xmin, ymin, xmax, ymax] = normalized;
+                    return (
+                      <div
+                        key={idx}
+                        className="absolute border-2 border-red-500 bg-red-500/10 pointer-events-none transition-all"
+                        style={{
+                          left: `${xmin}%`,
+                          top: `${ymin}%`,
+                          width: `${xmax - xmin}%`,
+                          height: `${ymax - ymin}%`,
+                        }}
+                      >
+                        <span className="absolute -top-6 left-0 px-1.5 py-0.5 rounded bg-red-600 text-white font-mono text-[10px] whitespace-nowrap shadow">
+                          {box.label}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : result?.preview_image_base64 ? (
+              <div className="relative min-h-[440px] rounded-xl border border-border bg-[#121212] overflow-hidden flex flex-col justify-center items-center p-4 shadow-xl">
+                <div className="relative w-full h-[400px] flex items-center justify-center bg-black/60 rounded-lg overflow-hidden">
+                  <img
+                    src={result.preview_image_base64}
+                    alt="Satellite Source Preview"
+                    className="max-h-full max-w-full object-contain"
+                  />
+                  {/* Render Bounding Boxes for Single Preview */}
+                  {SHOW_GROUNDING_OVERLAYS && groundingBoxes.map((box, idx) => {
+                    const normalized = normalizeGroundingBox(box.box_normalized, "percent");
+                    if (!normalized) return null;
+                    const [xmin, ymin, xmax, ymax] = normalized;
+                    return (
+                      <div
+                        key={idx}
+                        className="absolute border-2 border-red-500 bg-red-500/10 pointer-events-none transition-all"
+                        style={{
+                          left: `${xmin}%`,
+                          top: `${ymin}%`,
+                          width: `${xmax - xmin}%`,
+                          height: `${ymax - ymin}%`,
+                        }}
+                      >
+                        <span className="absolute -top-6 left-0 px-1.5 py-0.5 rounded bg-red-600 text-white font-mono text-[10px] whitespace-nowrap shadow">
+                          {box.label}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : inputMode === "location" ? (
+              /* Location mode empty state: show placeholder until result arrives */
+              <div className="relative min-h-[440px] rounded-xl border border-border/50 bg-[#0a0c0f] overflow-hidden flex flex-col justify-center items-center gap-5 shadow-xl p-8">
+                <div className="flex h-16 w-16 items-center justify-center rounded-full border border-primary/20 bg-primary/5 text-primary/50">
+                  <Globe2 className="h-8 w-8" />
+                </div>
+                <div className="text-center space-y-1.5 max-w-xs">
+                  <p className="text-sm font-semibold text-foreground">
+                    {locationLat !== null ? "Location selected — ready to analyze" : "Select a location to begin"}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {locationLat !== null
+                      ? `Querying ${satCollection} scenes near ${locationLat.toFixed(4)}°, ${locationLon!.toFixed(4)}°. A preview will appear here after running the analysis.`
+                      : "Click on the map in the panel above, or enter coordinates manually to pick an area of interest."}
+                  </p>
+                </div>
+              </div>
+            ) : (
+              /* Upload mode empty-state dropzone */
+              <div
+                className="relative min-h-[440px] rounded-xl border-2 border-dashed border-border bg-[#0d0d0d] overflow-hidden flex flex-col justify-center items-center gap-4 p-8 shadow-xl cursor-pointer group hover:border-primary/50 transition-colors duration-200"
+                onClick={() => fileInputRef.current?.click()}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  const files = Array.from(e.dataTransfer.files).filter((f) =>
+                    /\.(tif|tiff|png|jpg|jpeg)$/i.test(f.name)
+                  );
+                  if (files.length > 0) {
+                    setUploadedFiles((prev) => [...prev, ...files].slice(0, 4));
+                    setError(null);
+                  }
+                }}
+              >
+                <div className="flex h-16 w-16 items-center justify-center rounded-full border border-border bg-card/60 text-muted-foreground group-hover:border-primary/40 group-hover:text-primary/70 transition-colors duration-200">
+                  <Upload className="h-7 w-7" />
+                </div>
+                <div className="text-center space-y-1">
+                  <p className="text-sm font-semibold text-foreground">
+                    {temporal === "bi-temporal"
+                      ? "Upload your own imagery"
+                      : "Upload an image to begin"}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Drag &amp; drop a GeoTIFF, JPEG, or PNG file here, or click to browse
+                  </p>
+                </div>
+                {/* Scenario configured badge */}
+                {temporal === "bi-temporal" && currentScenario ? (
+                  <div className="mt-1 flex items-center gap-2 px-3 py-1.5 rounded-md bg-accent/10 border border-accent/30 text-accent text-xs font-medium">
+                    <ScanSearch className="h-3.5 w-3.5 shrink-0" />
+                    Scenario configured: {currentScenario.title}
+                  </div>
+                ) : temporal === "bi-temporal" ? (
+                  <p className="text-[11px] font-mono text-muted-foreground/50 mt-1">
+                    No scenario selected — use the Scenario Preset buttons above to configure
+                  </p>
+                ) : null}
+              </div>
+            )}
+
+            {/* Generated Mask Output (if change detection returned mask) */}
+            {result?.visual_evidence && "mask_url" in result.visual_evidence && result.visual_evidence.mask_url && (
+              <div className="rounded-xl border border-border bg-card p-4 shadow-lg">
+                <p className="label-micro mb-3 text-muted-foreground">GENERATED INFERENCE CHANGE MASK</p>
+                <div className="relative rounded-lg overflow-hidden border border-border bg-black h-48 flex items-center justify-center">
+                  <img
+                    src={`${AI_SERVICE_URL}${result.visual_evidence.mask_url}`}
+                    alt="Inference Change Mask"
+                    className="max-h-full object-contain"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Right Column: Model Answer, Grounding Table & Auditable Trace */}
+          <div className="lg:col-span-5 space-y-6">
+            {/* Model Response Card */}
+            <div className="rounded-xl border border-border bg-card p-6 shadow-xl relative overflow-hidden">
+              <div className="flex items-center justify-between border-b border-border/60 pb-4 mb-4">
+                <span className="label-micro text-muted-foreground flex items-center gap-2">
+                  <Sparkles className="h-4 w-4 text-primary" /> MODEL ANSWER
+                </span>
+                <div className="flex items-center gap-2">
+                  {result && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleExportJson}
+                      className="h-7 text-xs px-2 text-muted-foreground hover:text-foreground"
+                    >
+                      <Download className="h-3.5 w-3.5 mr-1" /> JSON
+                    </Button>
+                  )}
+                  <span className="text-xs font-medium px-2.5 py-0.5 rounded bg-primary/10 border border-primary/20 text-primary">
+                    {result ? "Complete" : "Ready"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="min-h-[140px]">
+                {isRunning ? (
+                  <div className="flex items-center justify-center h-36">
+                    <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                  </div>
+                ) : result ? (
+                  <div className="space-y-4">
+                    <p className="text-body text-foreground leading-relaxed font-medium">
+                      {result.answer.replace(/\*\*/g, "").replace(/\s+/g, " ").trim()}
+                    </p>
+
+                    {/* Render Visual Grounding Evidence List */}
+                    {SHOW_GROUNDING_OVERLAYS && groundingBoxes.length > 0 && (
+                      <div className="pt-3 border-t border-border/40 space-y-2">
+                        <span className="label-micro text-muted-foreground block flex items-center gap-1.5">
+                          <Target className="h-3.5 w-3.5 text-red-400" /> Grounding Evidence ({groundingBoxes.length} Bounding Boxes)
+                        </span>
+                        <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                          {groundingBoxes.map((item, idx) => (
+                            <div key={idx} className="flex items-center justify-between p-2 rounded bg-[#141414] border border-border/50 text-xs">
+                              <span className="font-medium text-foreground truncate max-w-[200px]">{item.label}</span>
+                              <span className="font-mono text-primary text-[11px]">
+                                [{item.box_normalized.join(", ")}]
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Change Percentage if present */}
+                    {result.visual_evidence && "change_percentage" in result.visual_evidence && result.visual_evidence.change_percentage !== undefined && result.visual_evidence.change_percentage !== null && (
+                      <div className="pt-3 border-t border-border/40 flex items-center justify-between">
+                        <span className="label-micro text-muted-foreground">Detected Surface Change</span>
+                        <span className="font-mono text-lg font-bold text-primary">
+                          {result.visual_evidence.change_percentage}%
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Confidence Score Display (Flagged Backend Behavior: Hardcoded null by LLM) */}
+                    <div className="pt-2 border-t border-border/40 flex items-center justify-between text-xs text-muted-foreground">
+                      <span>Confidence Score</span>
+                      <span className="font-mono text-foreground font-semibold">
+                        {result.confidence !== null && result.confidence !== undefined
+                          ? `${(result.confidence * 100).toFixed(1)}%`
+                          : "N/A (Causal LLM)"}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-36 text-center text-muted-foreground">
+                    <p className="text-xs">Enter a query prompt above and click "Run SatQuery AI" to execute analysis.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Data Warnings Banner — shown when STAC fetch partially or fully failed */}
+            {result?.data_warnings && result.data_warnings.length > 0 && (
+              <div className="rounded-xl border border-blue-500/20 bg-slate-900/60 p-4 shadow-xl">
+                <div className="flex items-start gap-3">
+                  <svg className="h-4 w-4 text-sky-400 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+                  </svg>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs font-semibold text-sky-400 mb-1">Satellite Data Fetch Warning</p>
+                    <ul className="space-y-1">
+                      {result.data_warnings.map((w, i) => (
+                        <li key={i} className="text-xs text-slate-300/80 font-mono leading-snug break-words">{w}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Deterministic Metrics Panel — shown only when computed_metrics is present */}
+            {result?.computed_metrics && (
+              <ComputedMetricsPanel metrics={result.computed_metrics} />
+            )}
+
+            {/* Composed narrative — model answer fused with deterministic metrics.
+                Template composition on the backend; no second model call. */}
+            {result?.narrative && (
+              <div className="rounded-xl border border-border bg-[#0E0E0E] p-5 shadow-xl">
+                <div className="mb-2 flex items-center gap-2">
+                  <FileText className="h-4 w-4 shrink-0 text-primary" />
+                  <span className="label-micro text-muted-foreground">
+                    COMPOSED SUMMARY
+                  </span>
+                </div>
+                <p className="text-[13px] leading-relaxed text-foreground/90">
+                  {result.narrative}
+                </p>
+              </div>
+            )}
+
+            {/* Auditable Execution Trace — relocated to the dedicated /audit route.
+                PS-26167 requires the trace to remain inspectable, so this badge
+                links to it rather than removing it. */}
+            {result?.execution_trace && (
+              <Link
+                to="/audit"
+                className="group flex items-center justify-between gap-3 rounded-xl border border-border bg-[#0E0E0E] px-4 py-3 shadow-xl transition-colors hover:border-accent/40 hover:bg-white/[0.02]"
+              >
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <Terminal className="h-4 w-4 shrink-0 text-accent" />
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <span className="label-micro text-muted-foreground">
+                      AUDITABLE EXECUTION TRACE
+                    </span>
+                    <span className="rounded border border-accent/25 bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] text-accent">
+                      PS-COMPLIANT
+                    </span>
+                    <span className="font-mono text-[11px] text-primary">
+                      {result.execution_trace.task}
+                    </span>
+                    {result?.data_warnings && result.data_warnings.length > 0 && (
+                      <span className="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] text-amber-400">
+                        {result.data_warnings.length} WARNING
+                        {result.data_warnings.length > 1 ? "S" : ""}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <span className="shrink-0 font-mono text-[11px] text-muted-foreground group-hover:text-foreground">
+                  View trace →
+                </span>
+              </Link>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
